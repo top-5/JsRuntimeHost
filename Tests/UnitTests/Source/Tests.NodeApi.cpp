@@ -3,9 +3,93 @@
 #include <array>
 #include <cstdint>
 #include <future>
+#include <new>
 #include <napi/env.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+
+#if defined(NAPI_CPP_EXCEPTIONS)
+namespace
+{
+class StandardExceptionBoundaryHost final : public Napi::ObjectWrap<StandardExceptionBoundaryHost>
+{
+public:
+    explicit StandardExceptionBoundaryHost(const Napi::CallbackInfo& info) : ObjectWrap{info} {}
+
+    Napi::Value Read(const Napi::CallbackInfo&) { throw std::runtime_error{"expected host error"}; }
+    void Write(const Napi::CallbackInfo&) { throw std::bad_alloc{}; }
+
+    static Napi::Function Define(Napi::Env env)
+    {
+        return DefineClass(env, "StandardExceptionBoundaryHost", {
+            InstanceMethod("read", &StandardExceptionBoundaryHost::Read),
+            InstanceMethod("write", &StandardExceptionBoundaryHost::Write)});
+    }
+};
+}
+
+TEST(NodeApi, StandardErrorsStayInsideHostCallbacks)
+{
+    Babylon::AppRuntime runtime{};
+    std::promise<std::array<bool, 6>> result;
+    runtime.Dispatch([&result](Napi::Env env) {
+        try
+        {
+            env.Global().Set("standardValue", Napi::Function::New(env, [](const Napi::CallbackInfo&) -> Napi::Value {
+                throw std::runtime_error{"expected host error"};
+            }));
+            env.Global().Set("standardVoid", Napi::Function::New(env, [](const Napi::CallbackInfo&) {
+                throw std::bad_alloc{};
+            }));
+            env.Global().Set("StandardExceptionBoundaryHost", StandardExceptionBoundaryHost::Define(env));
+            env.Global().Set("allocationMessage", std::bad_alloc{}.what());
+            env.Global().Set("existingHostError", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
+                throw Napi::Error{info.Env(), info.Env().Global().Get("originalError")};
+            }));
+            env.Global().Set("ordinaryHostValue", Napi::Function::New(env, [](const Napi::CallbackInfo& info) {
+                return Napi::Number::New(info.Env(), 42);
+            }));
+            const auto checks = Napi::Eval(env, R"(
+                (() => {
+                    const host = new StandardExceptionBoundaryHost();
+                    const caught = (call, message) => {
+                        try { call(); return false; }
+                        catch (error) { return error instanceof Error && error.message === message; }
+                    };
+                    const result = [
+                        caught(standardValue, 'expected host error'),
+                        caught(standardVoid, allocationMessage),
+                        caught(() => host.read(), 'expected host error'),
+                        caught(() => host.write(), allocationMessage)
+                    ];
+                    globalThis.originalError = new RangeError('existing');
+                    try { existingHostError(); result.push(false); }
+                    catch (error) { result.push(error === originalError); }
+                    result.push(ordinaryHostValue() === 42);
+                    return result;
+                })()
+            )", "standard-host-errors.js").As<Napi::Array>();
+            std::array<bool, 6> passed{};
+            for (uint32_t i = 0; i < passed.size(); ++i)
+            {
+                passed[i] = checks.Get(i).As<Napi::Boolean>().Value();
+            }
+            result.set_value(passed);
+        }
+        catch (...)
+        {
+            result.set_exception(std::current_exception());
+        }
+    });
+
+    const auto passed = result.get_future().get();
+    for (size_t i = 0; i < passed.size(); ++i)
+    {
+        EXPECT_TRUE(passed[i]) << "Standard exception boundary case " << i;
+    }
+}
+#endif
 
 #if defined(JSRUNTIMEHOST_NAPI_ENGINE_JSI)
 TEST(NodeApi, ThrownHostErrorClearsPendingException)
